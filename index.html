@@ -100,6 +100,10 @@ body > * { position: relative; z-index: 1; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
 .dot.on { background: var(--surprise); box-shadow: 0 0 0 4px color-mix(in srgb, var(--surprise) 22%, transparent); }
 .dot.off { background: var(--anger); }
+.dot.load { background: var(--happiness); animation: blink 1s infinite; }
+@keyframes blink { 50% { opacity: .35; } }
+.loadbar { height: 3px; background: transparent; position: sticky; top: 0; z-index: 60; }
+.loadbar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--happiness), var(--surprise), var(--sadness), var(--fear)); transition: width .3s; }
 
 main { max-width: 1240px; margin: 0 auto; padding: 0 clamp(18px, 4vw, 48px) 80px; }
 section { scroll-margin-top: 90px; }
@@ -321,6 +325,7 @@ footer { border-top: 1px solid var(--line); padding: 26px clamp(18px, 4vw, 48px)
 </head>
 <body>
 
+<div class="loadbar" id="loadbar"><i id="loadfill"></i></div>
 <header class="bar">
   <div class="brand"><span class="brand-mark" aria-hidden="true"></span>EmotionLens</div>
   <nav class="nav" aria-label="Sections">
@@ -339,7 +344,7 @@ footer { border-top: 1px solid var(--line); padding: 26px clamp(18px, 4vw, 48px)
 <section class="hero" id="try">
   <div class="hero-head">
     <h1>How does this sentence feel?</h1>
-    <p>A fine-tuned BERT model reads your text and picks one of six emotions: happiness, sadness, anger, fear, surprise or neutral.</p>
+    <p>A fine-tuned BERT model reads your text and picks one of six emotions: happiness, sadness, anger, fear, surprise or neutral. It runs right here in your browser.</p>
   </div>
 
   <div class="stage">
@@ -375,7 +380,7 @@ footer { border-top: 1px solid var(--line); padding: 26px clamp(18px, 4vw, 48px)
     </div>
 
     <aside class="verdict" id="verdict" aria-live="polite">
-      <div class="verdict-empty" id="vEmpty"><span class="face">🫥</span>Start typing and the result shows up here.</div>
+      <div class="verdict-empty" id="vEmpty"><span class="face">🫥</span>Start typing and the result shows up here. The first visit downloads the model (about 110 MB), then it is cached.</div>
       <div id="vBody" hidden>
         <div class="v-top">
           <div class="v-emoji" id="vEmoji">😐</div>
@@ -464,7 +469,7 @@ footer { border-top: 1px solid var(--line); padding: 26px clamp(18px, 4vw, 48px)
       <p class="lede" id="accLede">Scores on sentences the model never saw during training.</p>
     </div>
   </div>
-  <div id="noMetrics" class="panel no-metrics" hidden>No scores yet. Put the <b>metrics.json</b> from Colab inside the <b>emotion_bert</b> folder, then reload this page.</div>
+  <div id="noMetrics" class="panel no-metrics" hidden>No scores found. Upload <b>metrics.json</b> to the Hugging Face model repo, then reload this page.</div>
   <div id="metricsBlock">
     <div class="stats">
       <div class="stat"><div class="stat-v" id="sAcc">–</div><div class="stat-l">of test sentences labelled correctly</div></div>
@@ -505,7 +510,7 @@ footer { border-top: 1px solid var(--line); padding: 26px clamp(18px, 4vw, 48px)
     <li><h3>Clean</h3><p>Lowercase everything, strip punctuation, links and @handles.</p></li>
     <li><h3>Baselines</h3><p>TF-IDF with logistic regression, then a BiLSTM in PyTorch.</p></li>
     <li><h3>Fine-tune</h3><p>bert-base-uncased with a weighted loss, trained on a Colab GPU.</p></li>
-    <li><h3>Serve</h3><p>A Flask API powers this page, with a neutral penalty at prediction time.</p></li>
+    <li><h3>Ship</h3><p>Converted to ONNX and shrunk to 8-bit, so it runs in the browser on GitHub Pages.</p></li>
   </ol>
   <div class="story">
     <div class="panel">
@@ -529,7 +534,12 @@ footer { border-top: 1px solid var(--line); padding: 26px clamp(18px, 4vw, 48px)
   <span id="trained"></span>
 </footer>
 
-<script>
+<script type="module">
+/* ============ in-browser model (transformers.js) ============ */
+// Change MODEL_ID if your Hugging Face username or repo name is different.
+const MODEL_ID = 'akshayaaaa0001/emotion-bert-web';
+import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
+
 /* ============ constants ============ */
 const ORDER = ['happiness', 'sadness', 'anger', 'fear', 'surprise', 'neutral'];
 const EMO = {
@@ -571,14 +581,100 @@ let recent = [];
 let batchRows = [];
 let batchFilter = 'all';
 
-async function post(url, body) {
-  const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  let data = {};
-  try { data = await res.json(); } catch (_) {}
-  if (!res.ok) throw new Error(data.error || `The server answered ${res.status}.`);
-  return data;
+/* ---------- local engine: same logic as the Flask app, but runs in the browser ---------- */
+const DEFAULT_NEUTRAL_PENALTY = 0.4;
+const MAX_BATCH = 100, MAX_EXPLAIN_WORDS = 30;
+let clf = null;
+const fileProgress = {};
+
+const modelReady = (async () => {
+  $('dot').className = 'dot load';
+  $('statusText').textContent = 'Downloading model…';
+  try {
+    clf = await pipeline('text-classification', MODEL_ID, {
+      dtype: 'q8',
+      progress_callback: p => {
+        if (p.status === 'progress' && p.total) {
+          fileProgress[p.file] = [p.loaded, p.total];
+          const [l, t] = Object.values(fileProgress).reduce((a, [x, y]) => [a[0] + x, a[1] + y], [0, 0]);
+          const pctDone = Math.round(100 * l / t);
+          $('loadfill').style.width = pctDone + '%';
+          $('statusText').textContent = `Downloading model ${pctDone}%`;
+        }
+      },
+    });
+    $('loadfill').style.width = '100%';
+    setTimeout(() => { $('loadbar').style.display = 'none'; }, 600);
+    $('dot').className = 'dot on';
+    $('statusText').textContent = 'Model ready, running in your browser';
+  } catch (e) {
+    console.error(e);
+    $('dot').className = 'dot off';
+    $('statusText').textContent = 'Model failed to load';
+    throw new Error('The model could not be loaded. Check your internet connection and that MODEL_ID points to a public Hugging Face repo, then reload.');
+  }
+})();
+
+function norm(t) {
+  return t.toLowerCase()
+    .replace(/\[name\]|http\S+|@\w+/g, '')
+    .replace(/[^a-z\s]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
-const offlineMsg = 'Could not reach the model. Start it with "python app.py" and reload this page.';
+
+function applyNeutralPenalty(scores, p) {
+  p = Math.min(Math.max(Number(p) || 0, 0), 1);
+  const adj = scores.map(s => ({ label: s.label, score: s.score * (s.label === 'neutral' ? 1 - p : 1) }));
+  const total = adj.reduce((a, s) => a + s.score, 0) || 1;
+  return adj.map(s => ({ label: s.label, score: s.score / total })).sort((a, b) => b.score - a.score);
+}
+
+async function predictMany(texts, p) {
+  await modelReady;
+  const cleaned = texts.map(norm);
+  const toRun = cleaned.filter(Boolean);
+  const raw = toRun.length ? await clf(toRun, { top_k: null }) : [];
+  let k = 0;
+  return texts.map((original, i) => {
+    const c = cleaned[i];
+    if (!c) return { text: original, normalized: c, emotion: 'neutral', confidence: 1, scores: [{ label: 'neutral', score: 1 }], raw_scores: [], note: 'No words left after cleaning' };
+    const r = [...raw[k++]].sort((a, b) => b.score - a.score);
+    const adj = applyNeutralPenalty(r, p);
+    return { text: original, normalized: c, emotion: adj[0].label, confidence: adj[0].score, scores: adj, raw_scores: r };
+  });
+}
+
+async function explain(result, p) {
+  const words = result.normalized.split(' ').slice(0, MAX_EXPLAIN_WORDS);
+  if (words.length < 2) return words.map(w => ({ word: w, weight: 1 }));
+  const variants = words.map((_, i) => words.filter((__, j) => j !== i).join(' '));
+  const out = await predictMany(variants, p);
+  const weights = out.map(r => result.confidence - ((r.scores.find(s => s.label === result.emotion) || {}).score || 0));
+  const top = Math.max(...weights.map(Math.abs)) || 1;
+  return words.map((w, i) => ({ word: w, weight: Math.round(1000 * weights[i] / top) / 1000 }));
+}
+
+async function post(url, body) {
+  const t0 = performance.now();
+  const p = body.neutral_penalty ?? DEFAULT_NEUTRAL_PENALTY;
+  if (url === '/explain') {
+    const text = String(body.text || '').trim();
+    if (!text) throw new Error('Please enter some text.');
+    const r = (await predictMany([text], p))[0];
+    r.words = r.normalized ? await explain(r, p) : [];
+    r.latency_ms = Math.round((performance.now() - t0) * 10) / 10;
+    return r;
+  }
+  if (url === '/batch') {
+    const texts = (body.texts || []).map(t => String(t).trim()).filter(Boolean).slice(0, MAX_BATCH);
+    if (!texts.length) throw new Error('Add at least one line of text.');
+    const results = await predictMany(texts, p);
+    return { results, latency_ms: Math.round((performance.now() - t0) * 10) / 10 };
+  }
+  throw new Error('Unknown action ' + url);
+}
+const offlineMsg = 'The model is not loaded. Check your internet connection and reload the page.';
 
 /* ============ mood ============ */
 function setMood(emotion) {
@@ -813,7 +909,7 @@ const gridC = 'rgba(220,215,255,0.07)';
 
 async function loadMetrics() {
   let m = {};
-  try { m = await (await fetch('/metrics')).json(); } catch (_) {}
+  try { m = await (await fetch(`https://huggingface.co/${MODEL_ID}/resolve/main/metrics.json`)).json(); } catch (_) {}
   if (!m || !m.bert) { $('noMetrics').hidden = false; $('metricsBlock').hidden = true; return; }
   const b = m.bert, cls = m.classes;
   $('sAcc').textContent = (b.accuracy * 100).toFixed(1) + '%';
@@ -879,19 +975,6 @@ async function loadMetrics() {
 }
 
 /* ============ status + nav ============ */
-async function health() {
-  try {
-    const h = await (await fetch('/health')).json();
-    $('dot').className = 'dot on'; $('statusText').textContent = 'Model ready';
-    if (h.default_neutral_penalty !== undefined) {
-      $('penalty').value = Math.round(h.default_neutral_penalty * 100);
-      $('penVal').textContent = $('penalty').value + '%';
-    }
-  } catch (_) {
-    $('dot').className = 'dot off'; $('statusText').textContent = 'Model offline';
-  }
-}
-
 const links = [...document.querySelectorAll('.nav a')];
 const io = new IntersectionObserver(entries => {
   entries.forEach(en => {
@@ -900,7 +983,7 @@ const io = new IntersectionObserver(entries => {
 }, { rootMargin: '-45% 0px -50% 0px' });
 document.querySelectorAll('main section').forEach(s => io.observe(s));
 
-health();
+modelReady.catch(e => { $('err').textContent = e.message; });
 loadMetrics();
 txt.focus();
 </script>
